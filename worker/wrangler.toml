@@ -1,0 +1,18 @@
+# Reference config. homecode deploys a pinned release of worker.js and owns the real values.
+name = "eval-store"
+main = "worker.js"
+compatibility_date = "2026-10-01"
+workers_dev = false
+
+[[r2_buckets]]
+binding = "BUCKET"
+bucket_name = "chewcorp-evals"
+
+[vars]
+BUCKET_NAME = "chewcorp-evals"
+ACCOUNT_ID = ""          # Cloudflare account id
+ACCESS_TEAM_DOMAIN = ""  # <team>.cloudflareaccess.com
+ACCESS_AUD = ""          # Access application AUD tag for evals.hamsterwheel.wtf
+RUNNERS = "{}"           # {"<service token client id>": "howork2", ...}
+
+# Secrets (wrangler secret put / Terraform): CF_API_TOKEN, R2_PARENT_ACCESS_KEY_ID

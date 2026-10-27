@@ -1,0 +1,15 @@
+[project]
+name = "eval-store"
+version = "0.1.0"
+description = "Put eval runs in the chewcorp-evals R2 bucket and get them back"
+requires-python = ">=3.12"
+
+[project.scripts]
+eval-store = "eval_store:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+py-modules = ["eval_store"]
