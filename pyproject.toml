@@ -1,6 +1,6 @@
 [project]
 name = "eval-store"
-version = "0.1.0"
+version = "0.1.1"
 description = "Put eval runs in the chewcorp-evals R2 bucket and get them back"
 requires-python = ">=3.12"
 
