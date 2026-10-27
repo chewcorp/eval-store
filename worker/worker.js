@@ -74,7 +74,8 @@ async function sha256Of(env, key) {
   return hex(await ds.digest);
 }
 
-const FILE = /^(?!manifest\.json$)[A-Za-z0-9._-]+(\/[A-Za-z0-9._-]+)*$/;
+const SEG = "(?!\\.\\.?(?:/|$))[A-Za-z0-9._-]+"; // no "." or ".." segments
+const FILE = new RegExp(`^(?!manifest\\.json$)${SEG}(/${SEG})*$`);
 
 async function create(request, env, runner) {
   const { harness, slug, retain = false } = await request.json();
@@ -87,6 +88,12 @@ async function create(request, env, runner) {
   // Conditional put: of two concurrent creates of one id, only one gets the marker.
   const open = JSON.stringify({ runner, prefix, created: new Date().toISOString() });
   if (!(await env.BUCKET.put(`_open/${id}`, open, { onlyIf: { etagDoesNotMatch: "*" } }))) return exists;
+  // /done writes the record before it drops the marker, so a run finished since the
+  // first check shows up here; don't reopen it.
+  if (await env.BUCKET.head(`_manifests/${id}.json`)) {
+    await env.BUCKET.delete(`_open/${id}`);
+    return exists;
+  }
   try {
     return json({ run_id: id, ...(await mint(env, prefix, "object-read-write")) }, 201);
   } catch (e) {

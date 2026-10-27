@@ -106,7 +106,7 @@ test("submit, done, retain, read", async () => {
   assert.equal((await call(e, "POST", `/runs/${grant.run_id}/done`, { runner: "forged", files: [] }, "cid-cursor.access"))[0], 403);
   const files = [{ path: "run.tar.gz", bytes: 3, sha256: sha("tar") }];
   assert.equal((await call(e, "POST", `/runs/${grant.run_id}/done`, { files: [{ ...files[0], sha256: sha("tab") }] }))[0], 422, "same size, wrong hash");
-  for (const bad of [{ path: "manifest.json", bytes: 3, sha256: "a".repeat(64) }, { path: 7, bytes: 3 }, { path: "run.tar.gz", bytes: "3", sha256: "a".repeat(64) }]) {
+  for (const bad of [{ path: "manifest.json", bytes: 3, sha256: "a".repeat(64) }, { path: 7, bytes: 3 }, { path: "a/../run.tar.gz", bytes: 3, sha256: "a".repeat(64) }, { path: "run.tar.gz", bytes: "3", sha256: "a".repeat(64) }]) {
     assert.equal((await call(e, "POST", `/runs/${grant.run_id}/done`, { files: [bad] }))[0], 400);
   }
   assert.equal((await call(e, "POST", `/runs/${grant.run_id}/retain`, {}))[0], 404, "an open run cannot be retained");
@@ -171,4 +171,20 @@ test("retain refuses a file rewritten after /done; GET on an expired run is 410"
   e.BUCKET.put = put;
   e.BUCKET.m.delete(`${grant.prefix}run.tar.gz`); // lifecycle expiry
   assert.equal((await call(e, "GET", `/runs/${grant.run_id}/`))[0], 410);
+});
+
+test("a run finished between create's check and its marker is not reopened", async () => {
+  const e = env();
+  const head = e.BUCKET.head;
+  let first = true;
+  e.BUCKET.head = async (k) => {
+    if (k.startsWith("_manifests/") && first) {
+      first = false;
+      e.BUCKET.m.set(k, "{}"); // another runner's /done lands right after this check
+      return null;
+    }
+    return head(k);
+  };
+  assert.equal((await call(e, "POST", "/runs", { harness: "h", slug: "race" }))[0], 409);
+  assert.ok(![...e.BUCKET.m.keys()].some((k) => k.startsWith("_open/")), "the marker is released");
 });
