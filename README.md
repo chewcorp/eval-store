@@ -15,8 +15,8 @@ eval run storage proposal linked there.
 ## Client
 
 ```bash
-pip install git+https://github.com/chewcorp/eval-store@v0.1.0
-# or one file: gh release download v0.1.0 -R chewcorp/eval-store -p eval_store.py
+pip install git+https://github.com/chewcorp/eval-store@v0.1.1
+# or one file: gh release download v0.1.1 -R chewcorp/eval-store -p eval_store.py
 ```
 
 ```bash
@@ -42,9 +42,9 @@ web where the proxy injects them. `EVAL_STORE_URL` overrides the endpoint.
 | Route | Does |
 |---|---|
 | `POST /runs` `{harness, slug, retain}` | Run id `<UTC yyyymmddThhmmZ>-<harness>-<slug>`; read-write credential for `runs/<id>/` or `retained/<id>/` |
-| `POST /runs/<id>/done` manifest | Checks each listed file exists at its size, writes `manifest.json`, stamps `runner` from the Access identity |
-| `POST /runs/<id>/retain` | Copies `runs/<id>/` to `retained/<id>/`, sets `retain: true`. Any runner |
-| `GET /runs/<id>/` | Read-only credential for wherever the run lives, plus the Worker's copy of its manifest |
+| `POST /runs/<id>/done` manifest | Checks each listed file exists at its size and sha256, writes `manifest.json`, stamps `runner` from the Access identity |
+| `POST /runs/<id>/retain` | Copies `runs/<id>/` to `retained/<id>/` (R2 re-checks each sha256), sets `retain: true`. Any runner |
+| `GET /runs/<id>/` | Read-only credential for wherever the run lives, plus the Worker's copy of its manifest; 410 once expired |
 
 The Worker re-verifies the Access JWT (`Cf-Access-Jwt-Assertion`) and maps its
 `common_name` (the service token's client id) to a runner name through

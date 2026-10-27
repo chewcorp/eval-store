@@ -1,6 +1,22 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { handle } from "./worker.js";
+
+const sha = (v) => createHash("sha256").update(v).digest("hex");
+
+// Workers' crypto.DigestStream, which Node lacks.
+globalThis.crypto.DigestStream = class extends WritableStream {
+  constructor() {
+    const h = createHash("sha256");
+    let done;
+    super({ write: (c) => void h.update(c), close: () => done(h.digest().buffer) });
+    this.digest = new Promise((r) => (done = r));
+  }
+};
+
+const stream = (v) => new Response(v).body;
+const text = async (v) => (v instanceof ReadableStream ? new Response(v).text() : v);
 
 const enc = (o) => Buffer.from(JSON.stringify(o)).toString("base64url");
 
@@ -20,13 +36,15 @@ async function jwt(claims) {
 
 function bucket() {
   const m = new Map();
-  const obj = (v) => ({ body: v, httpMetadata: {}, json: async () => JSON.parse(v) });
+  const obj = (v) => ({ body: stream(v), httpMetadata: {}, json: async () => JSON.parse(v) });
   return {
     m,
     head: async (k) => (m.has(k) ? { size: String(m.get(k)).length } : null),
     get: async (k) => (m.has(k) ? obj(m.get(k)) : null),
     put: async (k, v, opts) => {
       if (opts?.onlyIf?.etagDoesNotMatch === "*" && m.has(k)) return null;
+      v = await text(v);
+      if (opts?.sha256 && sha(v) !== opts.sha256) throw new TypeError("checksum mismatch");
       m.set(k, v);
       return {};
     },
@@ -86,8 +104,9 @@ test("submit, done, retain, read", async () => {
 
   e.BUCKET.m.set(`${grant.prefix}run.tar.gz`, "tar");
   assert.equal((await call(e, "POST", `/runs/${grant.run_id}/done`, { runner: "forged", files: [] }, "cid-cursor.access"))[0], 403);
-  const files = [{ path: "run.tar.gz", bytes: 3, sha256: "a".repeat(64) }];
-  for (const bad of [{ path: "manifest.json", bytes: 3, sha256: "a".repeat(64) }, { path: 7, bytes: 3 }, { path: "run.tar.gz", bytes: "3", sha256: "a".repeat(64) }]) {
+  const files = [{ path: "run.tar.gz", bytes: 3, sha256: sha("tar") }];
+  assert.equal((await call(e, "POST", `/runs/${grant.run_id}/done`, { files: [{ ...files[0], sha256: sha("tab") }] }))[0], 422, "same size, wrong hash");
+  for (const bad of [{ path: "manifest.json", bytes: 3, sha256: "a".repeat(64) }, { path: 7, bytes: 3 }, { path: "a/../run.tar.gz", bytes: 3, sha256: "a".repeat(64) }, { path: "run.tar.gz", bytes: "3", sha256: "a".repeat(64) }]) {
     assert.equal((await call(e, "POST", `/runs/${grant.run_id}/done`, { files: [bad] }))[0], 400);
   }
   assert.equal((await call(e, "POST", `/runs/${grant.run_id}/retain`, {}))[0], 404, "an open run cannot be retained");
@@ -135,4 +154,37 @@ test("a failed mint frees the id; a concurrent create gets 409", async () => {
   const [ok] = await call(e, "POST", "/runs", { harness: "h", slug: "s" });
   assert.equal(ok, 201);
   assert.equal((await call(e, "POST", "/runs", { harness: "h", slug: "s" }, "cid-cursor.access"))[0], 409);
+});
+
+test("retain refuses a file rewritten after /done; GET on an expired run is 410", async () => {
+  const e = env();
+  const [, grant] = await call(e, "POST", "/runs", { harness: "h", slug: "x" });
+  e.BUCKET.m.set(`${grant.prefix}run.tar.gz`, "tar");
+  assert.equal((await call(e, "POST", `/runs/${grant.run_id}/done`, { files: [{ path: "run.tar.gz", bytes: 3, sha256: sha("tar") }] }))[0], 200);
+  e.BUCKET.m.set(`${grant.prefix}run.tar.gz`, "bad"); // the runner's credential is still live
+  assert.equal((await call(e, "POST", `/runs/${grant.run_id}/retain`, {}))[0], 409);
+  assert.ok(!e.BUCKET.m.has(`retained/${grant.run_id}/run.tar.gz`));
+  e.BUCKET.m.set(`${grant.prefix}run.tar.gz`, "tar");
+  const put = e.BUCKET.put;
+  e.BUCKET.put = async () => { throw new Error("R2 down"); };
+  await assert.rejects(call(e, "POST", `/runs/${grant.run_id}/retain`, {}), /R2 down/, "a storage error is not a 409");
+  e.BUCKET.put = put;
+  e.BUCKET.m.delete(`${grant.prefix}run.tar.gz`); // lifecycle expiry
+  assert.equal((await call(e, "GET", `/runs/${grant.run_id}/`))[0], 410);
+});
+
+test("a run finished between create's check and its marker is not reopened", async () => {
+  const e = env();
+  const head = e.BUCKET.head;
+  let first = true;
+  e.BUCKET.head = async (k) => {
+    if (k.startsWith("_manifests/") && first) {
+      first = false;
+      e.BUCKET.m.set(k, "{}"); // another runner's /done lands right after this check
+      return null;
+    }
+    return head(k);
+  };
+  assert.equal((await call(e, "POST", "/runs", { harness: "h", slug: "race" }))[0], 409);
+  assert.ok(![...e.BUCKET.m.keys()].some((k) => k.startsWith("_open/")), "the marker is released");
 });

@@ -64,7 +64,18 @@ async function mint(env, prefix, permission) {
 // prefix, so a runner's credential (live for an hour after /done) cannot rewrite it,
 // and its `prefix` says where the run lives now. A run without one is not finished.
 const record = async (env, id) => (await env.BUCKET.get(`_manifests/${id}.json`))?.json();
-const FILE = /^(?!manifest\.json$)[A-Za-z0-9._-]+(\/[A-Za-z0-9._-]+)*$/;
+const hex = (buf) => [...new Uint8Array(buf)].map((b) => b.toString(16).padStart(2, "0")).join("");
+
+async function sha256Of(env, key) {
+  const o = await env.BUCKET.get(key);
+  if (!o) return null;
+  const ds = new crypto.DigestStream("SHA-256"); // Workers-only; streams, so size is unbounded
+  await o.body.pipeTo(ds);
+  return hex(await ds.digest);
+}
+
+const SEG = "(?!\\.\\.?(?:/|$))[A-Za-z0-9._-]+"; // no "." or ".." segments
+const FILE = new RegExp(`^(?!manifest\\.json$)${SEG}(/${SEG})*$`);
 
 async function create(request, env, runner) {
   const { harness, slug, retain = false } = await request.json();
@@ -77,6 +88,12 @@ async function create(request, env, runner) {
   // Conditional put: of two concurrent creates of one id, only one gets the marker.
   const open = JSON.stringify({ runner, prefix, created: new Date().toISOString() });
   if (!(await env.BUCKET.put(`_open/${id}`, open, { onlyIf: { etagDoesNotMatch: "*" } }))) return exists;
+  // /done writes the record before it drops the marker, so a run finished since the
+  // first check shows up here; don't reopen it.
+  if (await env.BUCKET.head(`_manifests/${id}.json`)) {
+    await env.BUCKET.delete(`_open/${id}`);
+    return exists;
+  }
   try {
     return json({ run_id: id, ...(await mint(env, prefix, "object-read-write")) }, 201);
   } catch (e) {
@@ -98,6 +115,7 @@ async function done(request, env, runner, id) {
     }
     const o = await env.BUCKET.head(`${meta.prefix}${f.path}`);
     if (!o || o.size !== f.bytes) return json({ error: `${f.path}: missing or not ${f.bytes} bytes` }, 422);
+    if ((await sha256Of(env, `${meta.prefix}${f.path}`)) !== f.sha256) return json({ error: `${f.path}: sha256 mismatch` }, 422);
   }
   for (const f of SERVER_FIELDS) delete manifest[f];
   const stamped = { ...manifest, run_id: id, runner, created: meta.created, retain: meta.prefix.startsWith("retained/") };
@@ -117,7 +135,14 @@ async function retain(env, id) {
   for (const f of rec.files) {
     const body = await env.BUCKET.get(`${rec.prefix}${f.path}`);
     if (!body) return json({ error: `${f.path}: gone from ${rec.prefix}` }, 410);
-    await env.BUCKET.put(`${to}${f.path}`, body.body, { httpMetadata: body.httpMetadata });
+    // R2 checks the sha256 on write and refuses a file rewritten since /done.
+    try {
+      await env.BUCKET.put(`${to}${f.path}`, body.body, { httpMetadata: body.httpMetadata, sha256: f.sha256 });
+    } catch (e) {
+      // Only a confirmed rewrite is a 409; anything else is a storage error worth retrying.
+      if ((await sha256Of(env, `${rec.prefix}${f.path}`)) === f.sha256) throw e;
+      return json({ error: `${f.path}: changed since /done, not retained` }, 409);
+    }
   }
   const { prefix, ...manifest } = { ...rec, retain: true };
   await env.BUCKET.put(`${to}manifest.json`, JSON.stringify(manifest, null, 2));
@@ -128,6 +153,9 @@ async function retain(env, id) {
 async function read(env, id) {
   const rec = await record(env, id);
   if (!rec) return json({ error: `no finished run ${id}` }, 404);
+  for (const f of rec.files) {
+    if (!(await env.BUCKET.head(`${rec.prefix}${f.path}`))) return json({ error: `run ${id} has expired` }, 410);
+  }
   const { prefix, ...manifest } = rec;
   return json({ run_id: id, manifest, ...(await mint(env, prefix, "object-read-only")) });
 }
