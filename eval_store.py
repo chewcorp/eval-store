@@ -80,11 +80,11 @@ def sha256_file(path):
 
 def pack(run, out, include=None):
     """Tar the run's files (all but its record, or only --include globs). Returns sha256."""
-    keep = record(run).name
+    keep = record(run)
     files = sorted(
         p.relative_to(run).as_posix()
         for p in run.rglob("*")
-        if p.is_file() and p.name != keep
+        if p.is_file() and p != keep
         and (not include or any(fnmatch.fnmatch(p.relative_to(run).as_posix(), g) for g in include))
     )
     if not files:
@@ -205,6 +205,8 @@ def pack_dir(a, out):
 
 def cmd_pack(a):
     out = pathlib.Path(a.output or f"{pathlib.Path(a.run).name}.pack")
+    if out.resolve().is_relative_to(pathlib.Path(a.run).resolve()):
+        sys.exit("eval-store: pack output must be outside the run dir")  # else the next pack swallows it
     out.mkdir(parents=True, exist_ok=True)
     m = pack_dir(a, out)
     print(out / TARBALL, m["files"][0]["sha256"])
@@ -234,7 +236,7 @@ def cmd_retain(a):
 
 
 def cmd_fetch(a):
-    """<run-dir> reads uri and sha256 from its result.json; <uri|run-id> takes them from the run's manifest."""
+    """<run-dir> reads uri and sha256 from its result.json; <uri|run-id> takes sha256 from the Worker."""
     src = pathlib.Path(a.source)
     if src.is_dir():
         art = json.loads(record(src).read_text())["artifacts"]
@@ -247,10 +249,8 @@ def cmd_fetch(a):
         sys.exit("eval-store: fetch <uri|run-id> needs a dest")
     grant = api("GET", f"/runs/{run_id}/")
     with tempfile.TemporaryDirectory() as tmp:
-        if sha is None:
-            s3_get(grant, "manifest.json", pathlib.Path(tmp, "manifest.json"))
-            files = json.loads(pathlib.Path(tmp, "manifest.json").read_text())["files"]
-            sha = next(f["sha256"] for f in files if f["path"] == name)
+        if sha is None:  # the Worker's own copy, not the one in the run prefix
+            sha = next(f["sha256"] for f in grant["manifest"]["files"] if f["path"] == name)
         got = pathlib.Path(tmp) / name
         s3_get(grant, name, got)
         if sha256_file(got) != sha:

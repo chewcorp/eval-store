@@ -44,11 +44,13 @@ web where the proxy injects them. `EVAL_STORE_URL` overrides the endpoint.
 | `POST /runs` `{harness, slug, retain}` | Run id `<UTC yyyymmddThhmmZ>-<harness>-<slug>`; read-write credential for `runs/<id>/` or `retained/<id>/` |
 | `POST /runs/<id>/done` manifest | Checks each listed file exists at its size, writes `manifest.json`, stamps `runner` from the Access identity |
 | `POST /runs/<id>/retain` | Copies `runs/<id>/` to `retained/<id>/`, sets `retain: true`. Any runner |
-| `GET /runs/<id>/` | Read-only credential for wherever the run lives (retained wins) |
+| `GET /runs/<id>/` | Read-only credential for wherever the run lives, plus the Worker's copy of its manifest |
 
 The Worker re-verifies the Access JWT (`Cf-Access-Jwt-Assertion`) and maps its
 `common_name` (the service token's client id) to a runner name through
-`RUNNERS`. It never deletes a run. R2 temporary credentials offer no write-only
+`RUNNERS`. It keeps its own copy of each finished manifest under `_manifests/`,
+outside every run prefix, so a runner cannot rewrite what readers trust. It
+never deletes a run. R2 temporary credentials offer no write-only
 permission, so a submit credential is `object-read-write` on its one prefix.
 Configuration is in `worker/wrangler.toml`; secrets `CF_API_TOKEN` and
 `R2_PARENT_ACCESS_KEY_ID` are set at deploy, never in this repo.

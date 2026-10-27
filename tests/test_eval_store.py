@@ -43,20 +43,21 @@ class Pack(unittest.TestCase):
             (run / "result.json").write_text("{}")
             (run / "export.json").write_text("x")
             (run / "sub" / "session1.txt").write_text("y")
+            (run / "sub" / "result.json").write_text("{}")  # only the top-level record stays out
             a = eval_store.pack(run, pathlib.Path(tmp, "a.tgz"))
             os.utime(run / "export.json", (0, 12345))
             b = eval_store.pack(run, pathlib.Path(tmp, "b.tgz"))
             self.assertEqual(a, b)
             import tarfile
             with tarfile.open(pathlib.Path(tmp, "a.tgz")) as t:
-                self.assertEqual(t.getnames(), ["export.json", "sub/session1.txt"])
+                self.assertEqual(t.getnames(), ["export.json", "sub/result.json", "sub/session1.txt"])
             only = eval_store.pack(run, pathlib.Path(tmp, "c.tgz"), include=["session*.txt", "sub/*"])
             self.assertNotEqual(only, a)
 
 
 class Fake(http.server.BaseHTTPRequestHandler):
     """Worker API plus S3 object store, in one, without auth."""
-    objects, calls, parts = {}, [], {}
+    objects, calls, parts, manifests = {}, [], {}, {}
 
     def log_message(self, *a):
         pass
@@ -84,7 +85,7 @@ class Fake(http.server.BaseHTTPRequestHandler):
             run_id = f"20261027T2300Z-{body['harness']}-{body['slug']}"
             return self.reply(self.grant(run_id, f"runs/{run_id}/"), 201)
         if self.path.endswith("/done"):
-            Fake.objects[f"/s3/b/runs/{body['run_id']}/manifest.json"] = json.dumps(body).encode()
+            Fake.manifests[body["run_id"]] = body
         return self.reply({"ok": True})
 
     def multipart(self):
@@ -119,7 +120,7 @@ class Fake(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path.startswith("/runs/"):
             run_id = self.path.split("/")[2]
-            return self.reply(self.grant(run_id, f"runs/{run_id}/"))
+            return self.reply({**self.grant(run_id, f"runs/{run_id}/"), "manifest": Fake.manifests[run_id]})
         data = Fake.objects[self.path]
         self.send_response(200)
         self.send_header("Content-Length", str(len(data)))
@@ -192,6 +193,8 @@ class EndToEnd(unittest.TestCase):
             self.assertEqual(m["files"][0]["sha256"], eval_store.sha256_file(out / "run.tar.gz"))
             self.assertEqual((m["card"], m["retain"], m["run_id"]), ("CCP-1", False, None))
             self.assertNotIn("runner", m)
+            with self.assertRaises(SystemExit):
+                eval_store.main(["pack", str(run), "--harness", "h", "-o", str(run / "out")])
 
 
 if __name__ == "__main__":

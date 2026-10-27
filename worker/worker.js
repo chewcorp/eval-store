@@ -60,24 +60,29 @@ async function mint(env, prefix, permission) {
   };
 }
 
-// Where a run lives now; retained/ wins if a retain copy exists.
-async function locate(env, id) {
-  for (const prefix of [`retained/${id}/`, `runs/${id}/`]) {
-    if ((await env.BUCKET.list({ prefix, limit: 1 })).objects.length) return prefix;
-  }
-  return null;
-}
+// The Worker's own copy of each finished run's manifest. It sits outside every run
+// prefix, so a runner's credential (live for an hour after /done) cannot rewrite it,
+// and its `prefix` says where the run lives now. A run without one is not finished.
+const record = async (env, id) => (await env.BUCKET.get(`_manifests/${id}.json`))?.json();
+const FILE = /^(?!manifest\.json$)[A-Za-z0-9._-]+(\/[A-Za-z0-9._-]+)*$/;
 
 async function create(request, env, runner) {
   const { harness, slug, retain = false } = await request.json();
   if (!NAME.test(harness || "") || !NAME.test(slug || "")) return json({ error: "harness and slug: [a-z0-9-], max 48" }, 400);
   const stamp = new Date().toISOString().replace(/[-:]/g, "").slice(0, 13) + "Z";
   const id = `${stamp}-${harness}-${slug}`;
-  if ((await env.BUCKET.head(`_open/${id}`)) || (await locate(env, id))) return json({ error: `run ${id} exists` }, 409);
   const prefix = `${retain ? "retained" : "runs"}/${id}/`;
-  // Kept outside the run prefix so the runner's own credential cannot rewrite it.
-  await env.BUCKET.put(`_open/${id}`, JSON.stringify({ runner, prefix, created: new Date().toISOString() }));
-  return json({ run_id: id, ...(await mint(env, prefix, "object-read-write")) }, 201);
+  const exists = json({ error: `run ${id} exists` }, 409);
+  if (await env.BUCKET.head(`_manifests/${id}.json`)) return exists;
+  // Conditional put: of two concurrent creates of one id, only one gets the marker.
+  const open = JSON.stringify({ runner, prefix, created: new Date().toISOString() });
+  if (!(await env.BUCKET.put(`_open/${id}`, open, { onlyIf: { etagDoesNotMatch: "*" } }))) return exists;
+  try {
+    return json({ run_id: id, ...(await mint(env, prefix, "object-read-write")) }, 201);
+  } catch (e) {
+    await env.BUCKET.delete(`_open/${id}`); // our own marker, so a retry can reuse the id
+    throw e;
+  }
 }
 
 async function done(request, env, runner, id) {
@@ -88,41 +93,43 @@ async function done(request, env, runner, id) {
   const manifest = await request.json();
   if (!Array.isArray(manifest.files) || !manifest.files.length) return json({ error: "manifest has no files" }, 400);
   for (const f of manifest.files) {
+    if (typeof f.path !== "string" || !FILE.test(f.path) || !Number.isInteger(f.bytes) || !/^[0-9a-f]{64}$/.test(f.sha256)) {
+      return json({ error: `bad file entry ${JSON.stringify(f).slice(0, 200)}` }, 400);
+    }
     const o = await env.BUCKET.head(`${meta.prefix}${f.path}`);
     if (!o || o.size !== f.bytes) return json({ error: `${f.path}: missing or not ${f.bytes} bytes` }, 422);
   }
   for (const f of SERVER_FIELDS) delete manifest[f];
   const stamped = { ...manifest, run_id: id, runner, created: meta.created, retain: meta.prefix.startsWith("retained/") };
   await env.BUCKET.put(`${meta.prefix}manifest.json`, JSON.stringify(stamped, null, 2));
+  await env.BUCKET.put(`_manifests/${id}.json`, JSON.stringify({ ...stamped, prefix: meta.prefix }));
   await env.BUCKET.delete(`_open/${id}`); // the marker only; run objects are never deleted
   return json(stamped);
 }
 
+// Copies the files the finished manifest lists, then flips the record last, so a
+// failed copy leaves the run where it was and a retry redoes it.
 async function retain(env, id) {
-  const prefix = await locate(env, id);
-  if (!prefix) return json({ error: `no run ${id}` }, 404);
-  if (prefix.startsWith("retained/")) return json({ run_id: id, prefix });
-  let cursor;
-  do {
-    const page = await env.BUCKET.list({ prefix, cursor });
-    for (const o of page.objects) {
-      const name = o.key.slice(prefix.length);
-      if (name === "manifest.json") continue;
-      const body = await env.BUCKET.get(o.key);
-      await env.BUCKET.put(`retained/${id}/${name}`, body.body, { httpMetadata: body.httpMetadata });
-    }
-    cursor = page.truncated ? page.cursor : undefined;
-  } while (cursor);
-  const old = await env.BUCKET.get(`${prefix}manifest.json`);
-  const manifest = old ? await old.json() : { run_id: id };
-  await env.BUCKET.put(`retained/${id}/manifest.json`, JSON.stringify({ ...manifest, retain: true }, null, 2));
-  return json({ run_id: id, prefix: `retained/${id}/` });
+  const rec = await record(env, id);
+  if (!rec) return json({ error: `no finished run ${id}` }, 404);
+  const to = `retained/${id}/`;
+  if (rec.prefix === to) return json({ run_id: id, prefix: to });
+  for (const f of rec.files) {
+    const body = await env.BUCKET.get(`${rec.prefix}${f.path}`);
+    if (!body) return json({ error: `${f.path}: gone from ${rec.prefix}` }, 410);
+    await env.BUCKET.put(`${to}${f.path}`, body.body, { httpMetadata: body.httpMetadata });
+  }
+  const { prefix, ...manifest } = { ...rec, retain: true };
+  await env.BUCKET.put(`${to}manifest.json`, JSON.stringify(manifest, null, 2));
+  await env.BUCKET.put(`_manifests/${id}.json`, JSON.stringify({ ...manifest, prefix: to }));
+  return json({ run_id: id, prefix: to });
 }
 
 async function read(env, id) {
-  const prefix = await locate(env, id);
-  if (!prefix) return json({ error: `no run ${id}` }, 404);
-  return json({ run_id: id, ...(await mint(env, prefix, "object-read-only")) });
+  const rec = await record(env, id);
+  if (!rec) return json({ error: `no finished run ${id}` }, 404);
+  const { prefix, ...manifest } = rec;
+  return json({ run_id: id, manifest, ...(await mint(env, prefix, "object-read-only")) });
 }
 
 export async function handle(request, env, fetchCerts) {

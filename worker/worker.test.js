@@ -25,7 +25,11 @@ function bucket() {
     m,
     head: async (k) => (m.has(k) ? { size: String(m.get(k)).length } : null),
     get: async (k) => (m.has(k) ? obj(m.get(k)) : null),
-    put: async (k, v) => m.set(k, v),
+    put: async (k, v, opts) => {
+      if (opts?.onlyIf?.etagDoesNotMatch === "*" && m.has(k)) return null;
+      m.set(k, v);
+      return {};
+    },
     delete: async (k) => m.delete(k),
     list: async ({ prefix, limit }) => ({
       objects: [...m.keys()].filter((k) => k.startsWith(prefix)).slice(0, limit).map((key) => ({ key })),
@@ -82,9 +86,14 @@ test("submit, done, retain, read", async () => {
 
   e.BUCKET.m.set(`${grant.prefix}run.tar.gz`, "tar");
   assert.equal((await call(e, "POST", `/runs/${grant.run_id}/done`, { runner: "forged", files: [] }, "cid-cursor.access"))[0], 403);
-  const files = [{ path: "run.tar.gz", bytes: 3, sha256: "x" }];
-  assert.equal((await call(e, "POST", `/runs/${grant.run_id}/done`, { files: [{ path: "run.tar.gz", bytes: 9 }] }))[0], 422);
-  assert.equal((await call(e, "POST", `/runs/${grant.run_id}/done`, { files: [{ path: "nope", bytes: 3 }] }))[0], 422);
+  const files = [{ path: "run.tar.gz", bytes: 3, sha256: "a".repeat(64) }];
+  for (const bad of [{ path: "manifest.json", bytes: 3, sha256: "a".repeat(64) }, { path: 7, bytes: 3 }, { path: "run.tar.gz", bytes: "3", sha256: "a".repeat(64) }]) {
+    assert.equal((await call(e, "POST", `/runs/${grant.run_id}/done`, { files: [bad] }))[0], 400);
+  }
+  assert.equal((await call(e, "POST", `/runs/${grant.run_id}/retain`, {}))[0], 404, "an open run cannot be retained");
+  assert.equal((await call(e, "GET", `/runs/${grant.run_id}/`))[0], 404, "an open run cannot be read");
+  assert.equal((await call(e, "POST", `/runs/${grant.run_id}/done`, { files: [{ path: "run.tar.gz", bytes: 9, sha256: "a".repeat(64) }] }))[0], 422);
+  assert.equal((await call(e, "POST", `/runs/${grant.run_id}/done`, { files: [{ path: "nope", bytes: 3, sha256: "a".repeat(64) }] }))[0], 422);
   const [d, manifest] = await call(e, "POST", `/runs/${grant.run_id}/done`, { runner: "forged", models: ["m"], files });
   assert.equal(d, 200);
   assert.equal(manifest.runner, "howork2");
@@ -97,7 +106,10 @@ test("submit, done, retain, read", async () => {
   assert.equal(JSON.parse(e.BUCKET.m.get(`retained/${grant.run_id}/manifest.json`)).retain, true);
   assert.ok(e.BUCKET.m.has(`runs/${grant.run_id}/run.tar.gz`), "retain copies; it never deletes");
 
+  // A runner overwriting the prefix copy after /done does not change what readers trust.
+  e.BUCKET.m.set(`retained/${grant.run_id}/manifest.json`, JSON.stringify({ files: [] }));
   const [g, read] = await call(e, "GET", `/runs/${grant.run_id}/`);
+  assert.deepEqual(read.manifest.files, files);
   assert.equal(g, 200);
   assert.equal(read.prefix, `retained/${grant.run_id}/`);
   assert.equal(minted.at(-1).permission, "object-read-only");
@@ -112,4 +124,15 @@ test("rejects bad names and run ids", async () => {
   const e = env();
   assert.equal((await call(e, "POST", "/runs", { harness: "../x", slug: "a" }))[0], 400);
   assert.equal((await call(e, "GET", "/runs/..%2Fruns/"))[0], 400);
+});
+
+test("a failed mint frees the id; a concurrent create gets 409", async () => {
+  const e = env();
+  const real = globalThis.fetch;
+  globalThis.fetch = async () => new Response(JSON.stringify({ success: false, errors: ["boom"] }));
+  await assert.rejects(call(e, "POST", "/runs", { harness: "h", slug: "s" }));
+  globalThis.fetch = real;
+  const [ok] = await call(e, "POST", "/runs", { harness: "h", slug: "s" });
+  assert.equal(ok, 201);
+  assert.equal((await call(e, "POST", "/runs", { harness: "h", slug: "s" }, "cid-cursor.access"))[0], 409);
 });
