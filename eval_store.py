@@ -175,6 +175,8 @@ def s3_get(grant, name, dest):
 def parse_uri(uri):
     """<base>/runs/<run-id>/<file> -> (run-id, file)."""
     parts = urllib.parse.urlsplit(uri).path.split("/")
+    if len(parts) != 4 or parts[1] != "runs" or any(p in ("", ".", "..") for p in parts[2:]):
+        sys.exit(f"eval-store: not an eval-store uri: {uri}")  # result.json is shared data; keep its names out of local paths
     return parts[2], parts[3]
 
 

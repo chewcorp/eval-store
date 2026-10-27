@@ -35,6 +35,14 @@ class SigV4(unittest.TestCase):
         self.assertIn("x-amz-security-token", h["authorization"])
 
 
+class ParseUri(unittest.TestCase):
+    def test_rejects_paths_that_escape(self):
+        self.assertEqual(eval_store.parse_uri("https://e/runs/id/run.tar.gz"), ("id", "run.tar.gz"))
+        for bad in ("https://e/runs/id/../x", "https://e/runs/../run.tar.gz", "https://e/runs/id/a/b", "https://e/other/id/x"):
+            with self.assertRaises(SystemExit):
+                eval_store.parse_uri(bad)
+
+
 class Pack(unittest.TestCase):
     def test_excludes_record_and_is_reproducible(self):
         with tempfile.TemporaryDirectory() as tmp:
