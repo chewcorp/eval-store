@@ -164,6 +164,11 @@ test("retain refuses a file rewritten after /done; GET on an expired run is 410"
   e.BUCKET.m.set(`${grant.prefix}run.tar.gz`, "bad"); // the runner's credential is still live
   assert.equal((await call(e, "POST", `/runs/${grant.run_id}/retain`, {}))[0], 409);
   assert.ok(!e.BUCKET.m.has(`retained/${grant.run_id}/run.tar.gz`));
+  e.BUCKET.m.set(`${grant.prefix}run.tar.gz`, "tar");
+  const put = e.BUCKET.put;
+  e.BUCKET.put = async () => { throw new Error("R2 down"); };
+  await assert.rejects(call(e, "POST", `/runs/${grant.run_id}/retain`, {}), /R2 down/, "a storage error is not a 409");
+  e.BUCKET.put = put;
   e.BUCKET.m.delete(`${grant.prefix}run.tar.gz`); // lifecycle expiry
   assert.equal((await call(e, "GET", `/runs/${grant.run_id}/`))[0], 410);
 });

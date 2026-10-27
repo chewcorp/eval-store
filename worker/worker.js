@@ -131,7 +131,9 @@ async function retain(env, id) {
     // R2 checks the sha256 on write and refuses a file rewritten since /done.
     try {
       await env.BUCKET.put(`${to}${f.path}`, body.body, { httpMetadata: body.httpMetadata, sha256: f.sha256 });
-    } catch {
+    } catch (e) {
+      // Only a confirmed rewrite is a 409; anything else is a storage error worth retrying.
+      if ((await sha256Of(env, `${rec.prefix}${f.path}`)) === f.sha256) throw e;
       return json({ error: `${f.path}: changed since /done, not retained` }, 409);
     }
   }
@@ -144,7 +146,9 @@ async function retain(env, id) {
 async function read(env, id) {
   const rec = await record(env, id);
   if (!rec) return json({ error: `no finished run ${id}` }, 404);
-  if (!(await env.BUCKET.head(`${rec.prefix}${rec.files[0].path}`))) return json({ error: `run ${id} has expired` }, 410);
+  for (const f of rec.files) {
+    if (!(await env.BUCKET.head(`${rec.prefix}${f.path}`))) return json({ error: `run ${id} has expired` }, 410);
+  }
   const { prefix, ...manifest } = rec;
   return json({ run_id: id, manifest, ...(await mint(env, prefix, "object-read-only")) });
 }
