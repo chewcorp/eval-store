@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { createHash } from "node:crypto";
+import { createHash, createHmac } from "node:crypto";
 import { handle } from "./worker.js";
 
 const sha = (v) => createHash("sha256").update(v).digest("hex");
@@ -67,11 +67,27 @@ const env = () => ({
   R2_PARENT_ACCESS_KEY_ID: "parent",
 });
 
-const minted = [];
-globalThis.fetch = async (url, init) => {
-  minted.push(JSON.parse(init.body));
-  return new Response(JSON.stringify({ success: true, result: { accessKeyId: "a", secretAccessKey: "s", sessionToken: "x" } }));
-};
+// Checks a grant the way R2 does (HS256 keyed with sha256 hex of the parent token)
+// and returns its claims.
+async function minted(grant) {
+  const c = grant.credentials;
+  const token = Buffer.from(c.sessionToken, "base64").toString();
+  assert.ok(token.startsWith("jwt/"));
+  const jwt = token.slice(4);
+  const [h, p, s] = jwt.split(".");
+  assert.equal(createHmac("sha256", sha("t")).update(`${h}.${p}`).digest("base64url"), s);
+  assert.equal(c.secretAccessKey, sha(jwt));
+  assert.equal(c.accessKeyId, "parent");
+  assert.deepEqual(JSON.parse(Buffer.from(h, "base64url")), { alg: "HS256", typ: "JWT" });
+  const claims = JSON.parse(Buffer.from(p, "base64url"));
+  assert.equal(claims.bucket, "chewcorp-evals");
+  assert.equal(claims.sub, "acct");
+  assert.equal(claims.iss, "parent");
+  assert.equal(claims.aud, "acct.r2.cloudflarestorage.com");
+  assert.equal(claims.exp - claims.iat, 3600);
+  assert.deepEqual(claims.paths, { prefixPaths: [grant.prefix], objectPaths: [] });
+  return claims;
+}
 
 const claims = (cn, extra = {}) => ({
   aud: ["aud1"], iss: "https://team.cloudflareaccess.com", common_name: cn, exp: Date.now() / 1000 + 60, ...extra,
@@ -98,8 +114,7 @@ test("submit, done, retain, read", async () => {
   assert.equal(s, 201);
   assert.match(grant.run_id, /^\d{8}T\d{4}Z-rule-ablation-sm-ccp$/);
   assert.equal(grant.prefix, `runs/${grant.run_id}/`);
-  assert.deepEqual(minted.at(-1).prefixes, [grant.prefix]);
-  assert.equal(minted.at(-1).permission, "object-read-write");
+  assert.equal((await minted(grant)).scope, "object-read-write");
   assert.equal((await call(e, "POST", "/runs", { harness: "rule-ablation", slug: "sm-ccp" }))[0], 409);
 
   e.BUCKET.m.set(`${grant.prefix}run.tar.gz`, "tar");
@@ -131,7 +146,7 @@ test("submit, done, retain, read", async () => {
   assert.deepEqual(read.manifest.files, files);
   assert.equal(g, 200);
   assert.equal(read.prefix, `retained/${grant.run_id}/`);
-  assert.equal(minted.at(-1).permission, "object-read-only");
+  assert.equal((await minted(read)).scope, "object-read-only");
 });
 
 test("retain at submit writes straight to retained/", async () => {
@@ -147,10 +162,9 @@ test("rejects bad names and run ids", async () => {
 
 test("a failed mint frees the id; a concurrent create gets 409", async () => {
   const e = env();
-  const real = globalThis.fetch;
-  globalThis.fetch = async () => new Response(JSON.stringify({ success: false, errors: ["boom"] }));
+  e.CF_API_TOKEN = "";
   await assert.rejects(call(e, "POST", "/runs", { harness: "h", slug: "s" }));
-  globalThis.fetch = real;
+  e.CF_API_TOKEN = "t";
   const [ok] = await call(e, "POST", "/runs", { harness: "h", slug: "s" });
   assert.equal(ok, 201);
   assert.equal((await call(e, "POST", "/runs", { harness: "h", slug: "s" }, "cid-cursor.access"))[0], 409);
