@@ -37,25 +37,40 @@ async function runnerFor(request, env, fetchCerts = fetch) {
   return JSON.parse(env.RUNNERS)[claims.common_name] || null;
 }
 
+// Signs the temporary credential locally, as Cloudflare documents for R2: the REST
+// temp-access-credentials endpoint refuses a bucket-scoped token, and the parent token
+// stays bucket-scoped. Parent secret access key = sha256 hex of the token value.
+const enc = (s) => new TextEncoder().encode(s);
+const b64urlOf = (bytes) => btoa(String.fromCharCode(...bytes)).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+const sha256Hex = async (s) => hex(await crypto.subtle.digest("SHA-256", enc(s)));
+
 async function mint(env, prefix, permission) {
-  const r = await fetch(`https://api.cloudflare.com/client/v4/accounts/${env.ACCOUNT_ID}/r2/temp-access-credentials`, {
-    method: "POST",
-    headers: { authorization: `Bearer ${env.CF_API_TOKEN}`, "content-type": "application/json" },
-    body: JSON.stringify({
-      bucket: env.BUCKET_NAME,
-      parentAccessKeyId: env.R2_PARENT_ACCESS_KEY_ID,
-      permission,
-      ttlSeconds: TTL,
-      prefixes: [prefix],
-    }),
-  });
-  const body = await r.json();
-  if (!body.success) throw new Error(`temp credential: ${JSON.stringify(body.errors)}`);
+  if (!env.CF_API_TOKEN || !env.R2_PARENT_ACCESS_KEY_ID) throw new Error("R2 parent token not configured");
+  const endpoint = `https://${env.ACCOUNT_ID}.r2.cloudflarestorage.com`;
+  const now = Math.floor(Date.now() / 1000);
+  const claims = {
+    bucket: env.BUCKET_NAME,
+    scope: permission,
+    paths: { prefixPaths: [prefix], objectPaths: [] },
+    sub: env.ACCOUNT_ID,
+    iss: env.R2_PARENT_ACCESS_KEY_ID,
+    aud: new URL(endpoint).host,
+    iat: now,
+    exp: now + TTL,
+  };
+  const unsigned = `${b64urlOf(enc(JSON.stringify({ alg: "HS256", typ: "JWT" })))}.${b64urlOf(enc(JSON.stringify(claims)))}`;
+  const key = await crypto.subtle.importKey("raw", enc(await sha256Hex(env.CF_API_TOKEN)), { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
+  const jwt = `${unsigned}.${b64urlOf(new Uint8Array(await crypto.subtle.sign("HMAC", key, enc(unsigned))))}`;
   return {
     bucket: env.BUCKET_NAME,
-    endpoint: `https://${env.ACCOUNT_ID}.r2.cloudflarestorage.com`,
+    endpoint,
     prefix,
-    credentials: { ...body.result, region: "auto" },
+    credentials: {
+      accessKeyId: env.R2_PARENT_ACCESS_KEY_ID,
+      secretAccessKey: await sha256Hex(jwt),
+      sessionToken: btoa(`jwt/${jwt}`),
+      region: "auto",
+    },
     expires_in: TTL,
   };
 }
