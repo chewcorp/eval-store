@@ -57,7 +57,8 @@ def record(run):
 
 
 def api(method, path, body=None):
-    headers = {"Content-Type": "application/json"}
+    # Cloudflare's Browser Integrity Check refuses urllib's default UA (error 1010)
+    headers = {"Content-Type": "application/json", "User-Agent": "eval-store"}
     if os.environ.get("EVAL_STORE_CLIENT_ID"):
         headers["CF-Access-Client-Id"] = os.environ["EVAL_STORE_CLIENT_ID"]
         headers["CF-Access-Client-Secret"] = os.environ.get("EVAL_STORE_CLIENT_SECRET", "")
